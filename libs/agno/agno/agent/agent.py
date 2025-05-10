@@ -144,6 +144,9 @@ class Agent:
     # "none" is the default when no tools are present. "auto" is the default if tools are present.
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
 
+    # A function that acts as middleware and is called around tool calls.
+    tool_hooks: Optional[List[Callable]] = None
+
     # --- Agent Reasoning ---
     # Enable reasoning by working through the problem step by step.
     reasoning: bool = False
@@ -301,6 +304,7 @@ class Agent:
         show_tool_calls: bool = True,
         tool_call_limit: Optional[int] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        tool_hooks: Optional[List[Callable]] = None,
         reasoning: bool = False,
         reasoning_model: Optional[Model] = None,
         reasoning_agent: Optional[Agent] = None,
@@ -385,6 +389,7 @@ class Agent:
         self.show_tool_calls = show_tool_calls
         self.tool_call_limit = tool_call_limit
         self.tool_choice = tool_choice
+        self.tool_hooks = tool_hooks
 
         self.reasoning = reasoning
         self.reasoning_model = reasoning_model
@@ -460,8 +465,6 @@ class Agent:
         # Agent session
         self.agent_session: Optional[AgentSession] = None
 
-        self._tools_for_model: Optional[List[Dict]] = None
-        self._functions_for_model: Optional[Dict[str, Function]] = None
         self._tool_instructions: Optional[List[str]] = None
 
         self._formatter: Optional[SafeFormatter] = None
@@ -779,7 +782,7 @@ class Agent:
                                 reasoning_step = self.update_reasoning_content_from_tool_call(tool_name, tool_args)
 
                                 metrics = tool_call.get("metrics")
-                                if metrics is not None:
+                                if metrics is not None and metrics.time is not None:
                                     reasoning_time_taken = reasoning_time_taken + float(metrics.time)
 
                     if self.stream_intermediate_steps:
@@ -952,12 +955,19 @@ class Agent:
                 self.memory.update_summary()
 
             # 10. Calculate session metrics
-            self.session_metrics = self.calculate_session_metrics(self.memory.messages)
+            self.session_metrics = self.calculate_metrics(self.memory.messages)
         elif isinstance(self.memory, Memory):
             # Add AgentRun to memory
             self.memory.add_run(session_id=session_id, run=self.run_response)
 
             self._make_memories_and_summaries(run_messages, session_id, user_id, messages)  # type: ignore
+
+            if self.session_metrics is None:
+                self.session_metrics = self.calculate_metrics(run_messages.messages)  # Calculate metrics for the run
+            else:
+                self.session_metrics += self.calculate_metrics(
+                    run_messages.messages
+                )  # Calculate metrics for the session
 
         # Yield UpdatingMemory event
         if self.stream_intermediate_steps:
@@ -1420,7 +1430,7 @@ class Agent:
                                 reasoning_step = self.update_reasoning_content_from_tool_call(tool_name, tool_args)
 
                                 metrics = tool_call.get("metrics")
-                                if metrics is not None:
+                                if metrics is not None and metrics.time is not None:
                                     reasoning_time_taken = reasoning_time_taken + float(metrics.time)
 
                     if self.stream_intermediate_steps:
@@ -1591,12 +1601,19 @@ class Agent:
             if self.memory.create_session_summary and self.memory.update_session_summary_after_run:
                 await self.memory.aupdate_summary()
 
-            self.session_metrics = self.calculate_session_metrics(self.memory.messages)
+            self.session_metrics = self.calculate_metrics(self.memory.messages)
         elif isinstance(self.memory, Memory):
             # Add AgentRun to memory
             self.memory.add_run(session_id=session_id, run=self.run_response)
 
             await self._amake_memories_and_summaries(run_messages, session_id, user_id, messages)  # type: ignore
+
+            if self.session_metrics is None:
+                self.session_metrics = self.calculate_metrics(run_messages.messages)  # Calculate metrics for the run
+            else:
+                self.session_metrics += self.calculate_metrics(
+                    run_messages.messages
+                )  # Calculate metrics for the session
 
         # Yield UpdatingMemory event
         if self.stream_intermediate_steps:
@@ -1842,6 +1859,7 @@ class Agent:
         session_messages: List[Message] = []
         self.memory = cast(Memory, self.memory)
         if self.enable_user_memories and run_messages.user_message is not None:
+            log_debug("Creating user memories.")
             self.memory.create_user_memories(message=run_messages.user_message.get_content_string(), user_id=user_id)
 
             # TODO: Possibly do both of these in one step
@@ -1870,10 +1888,8 @@ class Agent:
 
         # Update the session summary if needed
         if self.enable_session_summaries:
+            log_debug("Creating session summary.")
             self.memory.create_session_summary(session_id=session_id, user_id=user_id)
-
-        # Calculate session metrics
-        self.session_metrics = self.calculate_session_metrics(session_messages)
 
     async def _amake_memories_and_summaries(
         self,
@@ -1885,6 +1901,7 @@ class Agent:
         self.memory = cast(Memory, self.memory)
         session_messages: List[Message] = []
         if self.enable_user_memories and run_messages.user_message is not None:
+            log_debug("Creating user memories.")
             await self.memory.acreate_user_memories(
                 message=run_messages.user_message.get_content_string(), user_id=user_id
             )
@@ -1915,10 +1932,8 @@ class Agent:
 
         # Update the session summary if needed
         if self.enable_session_summaries:
+            log_debug("Creating session summary.")
             await self.memory.acreate_session_summary(session_id=session_id, user_id=user_id)
-
-        # Calculate session metrics
-        self.session_metrics = self.calculate_session_metrics(session_messages)
 
     def get_tools(
         self, session_id: str, async_mode: bool = False, user_id: Optional[str] = None
@@ -1942,6 +1957,15 @@ class Agent:
 
         # Add tools for accessing knowledge
         if self.knowledge is not None or self.retriever is not None:
+            # Check if retriever is an async function but used in sync mode
+            from inspect import iscoroutinefunction
+
+            if not async_mode and iscoroutinefunction(self.retriever):
+                log_warning(
+                    "Async retriever function is being used with synchronous agent.run() or agent.print_response(). "
+                    "It is recommended to use agent.arun() or agent.aprint_response() instead."
+                )
+
             if self.search_knowledge:
                 # Use async or sync search based on async_mode
                 if async_mode:
@@ -1961,10 +1985,24 @@ class Agent:
     def add_tools_to_model(
         self, model: Model, session_id: str, async_mode: bool = False, user_id: Optional[str] = None
     ) -> None:
-        # Skip if functions_for_model is not None
-        if self._functions_for_model is None or self._tools_for_model is None:
+        agent_tools = self.get_tools(session_id=session_id, async_mode=async_mode, user_id=user_id)
+        agent_tool_names = []
+        # Get all the tool names
+        if agent_tools is not None:
+            for tool in agent_tools:
+                if isinstance(tool, Function):
+                    agent_tool_names.append(tool.name)
+                elif isinstance(tool, Toolkit):
+                    agent_tool_names.extend([f for f in tool.functions.keys()])
+                elif callable(tool):
+                    agent_tool_names.append(tool.__name__)
+                else:
+                    agent_tool_names.append(str(tool))
+
+        # Create new functions if we don't have any set on the model OR if the list of tool names is different than what is set on the model
+        existing_model_functions = model.get_functions()
+        if existing_model_functions is None or set(existing_model_functions.keys()) != set(agent_tool_names):
             # Get Agent tools
-            agent_tools = self.get_tools(session_id=session_id, async_mode=async_mode, user_id=user_id)
             if agent_tools is not None and len(agent_tools) > 0:
                 log_debug("Processing tools for model")
 
@@ -1977,28 +2015,29 @@ class Agent:
                 ):
                     strict = True
 
-                self._tools_for_model = []
-                self._functions_for_model = {}
-
+                _tools_for_model = []
+                _functions_for_model = {}
                 for tool in agent_tools:
                     if isinstance(tool, Dict):
                         # If a dict is passed, it is a builtin tool
                         # that is run by the model provider and not the Agent
-                        self._tools_for_model.append(tool)
+                        _tools_for_model.append(tool)
                         log_debug(f"Included builtin tool {tool}")
 
                     elif isinstance(tool, Toolkit):
                         # For each function in the toolkit and process entrypoint
                         for name, func in tool.functions.items():
                             # If the function does not exist in self.functions
-                            if name not in self._functions_for_model:
+                            if name not in _functions_for_model:
                                 func._agent = self
                                 func.process_entrypoint(strict=strict)
-                                if strict:
+                                if strict and func.strict is None:
                                     func.strict = True
-                                self._functions_for_model[name] = func
-                                self._tools_for_model.append({"type": "function", "function": func.to_dict()})
-                                log_debug(f"Added function {name} from {tool.name}")
+                                if self.tool_hooks is not None:
+                                    func.tool_hooks = self.tool_hooks
+                                _functions_for_model[name] = func
+                                _tools_for_model.append({"type": "function", "function": func.to_dict()})
+                                log_debug(f"Added tool {name} from {tool.name}")
 
                         # Add instructions from the toolkit
                         if tool.add_instructions and tool.instructions is not None:
@@ -2007,14 +2046,16 @@ class Agent:
                             self._tool_instructions.append(tool.instructions)
 
                     elif isinstance(tool, Function):
-                        if tool.name not in self._functions_for_model:
+                        if tool.name not in _functions_for_model:
                             tool._agent = self
                             tool.process_entrypoint(strict=strict)
                             if strict and tool.strict is None:
                                 tool.strict = True
-                            self._functions_for_model[tool.name] = tool
-                            self._tools_for_model.append({"type": "function", "function": tool.to_dict()})
-                            log_debug(f"Added function {tool.name}")
+                            if self.tool_hooks is not None:
+                                tool.tool_hooks = self.tool_hooks
+                            _functions_for_model[tool.name] = tool
+                            _tools_for_model.append({"type": "function", "function": tool.to_dict()})
+                            log_debug(f"Added tool {tool.name}")
 
                         # Add instructions from the Function
                         if tool.add_instructions and tool.instructions is not None:
@@ -2025,21 +2066,23 @@ class Agent:
                     elif callable(tool):
                         try:
                             function_name = tool.__name__
-                            if function_name not in self._functions_for_model:
+                            if function_name not in _functions_for_model:
                                 func = Function.from_callable(tool, strict=strict)
                                 func._agent = self
                                 if strict:
                                     func.strict = True
-                                self._functions_for_model[func.name] = func
-                                self._tools_for_model.append({"type": "function", "function": func.to_dict()})
-                                log_debug(f"Added function {func.name}")
+                                if self.tool_hooks is not None:
+                                    func.tool_hooks = self.tool_hooks
+                                _functions_for_model[func.name] = func
+                                _tools_for_model.append({"type": "function", "function": func.to_dict()})
+                                log_debug(f"Added tool {func.name}")
                         except Exception as e:
-                            log_warning(f"Could not add function {tool}: {e}")
+                            log_warning(f"Could not add tool {tool}: {e}")
 
                 # Set tools on the model
-                model.set_tools(tools=self._tools_for_model)
+                model.set_tools(tools=_tools_for_model)
                 # Set functions on the model
-                model.set_functions(functions=self._functions_for_model)
+                model.set_functions(functions=_functions_for_model)
 
     def update_model(self, session_id: str, async_mode: bool = False, user_id: Optional[str] = None) -> None:
         self.set_default_model()
@@ -2058,7 +2101,9 @@ class Agent:
                     self.model.response_format = self.response_model
                     self.model.structured_outputs = True
                 else:
-                    log_debug("Model supports native structured outputs but not enabled. Using JSON mode instead.")
+                    log_debug(
+                        "Model supports native structured outputs but it is not enabled. Using JSON mode instead."
+                    )
                     self.model.response_format = json_response_format
                     self.model.structured_outputs = False
 
@@ -2080,8 +2125,6 @@ class Agent:
                 log_debug("Model does not support structured or JSON schema outputs.")
                 self.model.response_format = json_response_format
                 self.model.structured_outputs = False
-
-            log_debug(f"Structured outputs: {self.model.structured_outputs}")
 
         # Add tools to the Model
         self.add_tools_to_model(model=self.model, session_id=session_id, async_mode=async_mode, user_id=user_id)
@@ -2189,7 +2232,7 @@ class Agent:
             else:
                 self.memory = cast(Memory, self.memory)
                 # We fake the structure on storage, to maintain the interface with the legacy implementation
-                run_responses = self.memory.runs[session_id]  # type: ignore
+                run_responses = self.memory.runs.get(session_id, [])  # type: ignore
                 memory_dict = self.memory.to_dict()
                 memory_dict["runs"] = [rr.to_dict() for rr in run_responses]
         else:
@@ -2549,13 +2592,14 @@ class Agent:
             if self.add_state_in_messages:
                 sys_message_content = self.format_message_with_state_variables(sys_message_content)
 
-            # Add the JSON output prompt if response_model is provided and structured_outputs is False
+            # Add the JSON output prompt if response_model is provided and the model does not support native structured outputs or JSON schema outputs
+            # or if use_json_mode is True
             if (
-                self.response_model is not None
-                and self.model
-                and (
-                    self.model.supports_native_structured_outputs
-                    and (self.use_json_mode or self.structured_outputs is False)
+                self.model is not None
+                and self.response_model is not None
+                and not (
+                    (self.model.supports_native_structured_outputs or self.model.supports_json_schema_outputs)
+                    and (not self.use_json_mode or self.structured_outputs is True)
                 )
             ):
                 sys_message_content += f"\n{get_json_output_prompt(self.response_model)}"  # type: ignore
@@ -2756,14 +2800,15 @@ class Agent:
                         "You should ALWAYS prefer information from this conversation over the past summary.\n\n"
                     )
 
-        # 3.3.12 Finally, add the system message from the Model
+        # 3.3.12 Add the system message from the Model
         system_message_from_model = self.model.get_system_message_for_model()
         if system_message_from_model is not None:
             system_message_content += system_message_from_model
 
-        # Add the JSON output prompt if response_model is provided and structured_outputs is False (only applicable if the model supports structured outputs)
+        # 3.3.13 Add the JSON output prompt if response_model is provided and the model does not support native structured outputs or JSON schema outputs
+        # or if use_json_mode is True
         if self.response_model is not None and not (
-            self.model.supports_native_structured_outputs
+            (self.model.supports_native_structured_outputs or self.model.supports_json_schema_outputs)
             and (not self.use_json_mode or self.structured_outputs is True)
         ):
             system_message_content += f"{get_json_output_prompt(self.response_model)}"  # type: ignore
@@ -3302,7 +3347,7 @@ class Agent:
         from agno.document import Document
 
         if self.retriever is not None and callable(self.retriever):
-            from inspect import signature
+            from inspect import isawaitable, signature
 
             try:
                 sig = signature(self.retriever)
@@ -3310,7 +3355,12 @@ class Agent:
                 if "agent" in sig.parameters:
                     retriever_kwargs = {"agent": self}
                 retriever_kwargs.update({"query": query, "num_documents": num_documents, **kwargs})
-                return self.retriever(**retriever_kwargs)
+                result = self.retriever(**retriever_kwargs)
+
+                if isawaitable(result):
+                    result = await result
+
+                return result
             except Exception as e:
                 log_warning(f"Retriever failed: {e}")
                 return None
@@ -3449,7 +3499,7 @@ class Agent:
         aggregated_metrics: Dict[str, Any] = defaultdict(list)
         assistant_message_role = self.model.assistant_message_role if self.model is not None else "assistant"
         for m in messages:
-            if m.role == assistant_message_role and m.metrics is not None:
+            if m.role == assistant_message_role and m.metrics is not None and m.from_history is False:
                 for k, v in asdict(m.metrics).items():
                     if k == "timer":
                         continue
@@ -3459,7 +3509,7 @@ class Agent:
             aggregated_metrics = dict(aggregated_metrics)
         return aggregated_metrics
 
-    def calculate_session_metrics(self, messages: List[Message]) -> SessionMetrics:
+    def calculate_metrics(self, messages: List[Message]) -> SessionMetrics:
         session_metrics = SessionMetrics()
         assistant_message_role = self.model.assistant_message_role if self.model is not None else "assistant"
         for m in messages:
@@ -3673,7 +3723,9 @@ class Agent:
         reasoning_model: Optional[Model] = self.reasoning_model
         reasoning_model_provided = reasoning_model is not None
         if reasoning_model is None and self.model is not None:
-            reasoning_model = self.model.__class__(id=self.model.id)
+            from copy import deepcopy
+
+            reasoning_model = deepcopy(self.model)
         if reasoning_model is None:
             log_warning("Reasoning error. Reasoning model is None, continuing regular session...")
             return
@@ -3882,7 +3934,9 @@ class Agent:
         reasoning_model: Optional[Model] = self.reasoning_model
         reasoning_model_provided = reasoning_model is not None
         if reasoning_model is None and self.model is not None:
-            reasoning_model = self.model.__class__(id=self.model.id)
+            from copy import deepcopy
+
+            reasoning_model = deepcopy(self.model)
         if reasoning_model is None:
             log_warning("Reasoning error. Reasoning model is None, continuing regular session...")
             return
@@ -4075,6 +4129,142 @@ class Agent:
                     event=RunEvent.reasoning_completed,
                     session_id=session_id,
                 )
+
+    def update_reasoning_content_from_tool_call(
+        self, tool_name: str, tool_args: Dict[str, Any]
+    ) -> Optional[ReasoningStep]:
+        """Update reasoning_content based on tool calls that look like thinking or reasoning tools."""
+
+        # Case 1: ReasoningTools.think (has title, thought, optional action and confidence)
+        if tool_name.lower() == "think" and "title" in tool_args and "thought" in tool_args:
+            title = tool_args["title"]
+            thought = tool_args["thought"]
+            action = tool_args.get("action", "")
+            confidence = tool_args.get("confidence", None)
+
+            # Create a reasoning step
+            reasoning_step = ReasoningStep(
+                title=title,
+                reasoning=thought,
+                action=action,
+                next_action=NextAction.CONTINUE,
+                confidence=confidence,
+            )
+
+            # Add the step to the run response
+            self._add_reasoning_step_to_extra_data(reasoning_step)
+
+            formatted_content = f"## {title}\n{thought}\n"
+            if action:
+                formatted_content += f"Action: {action}\n"
+            if confidence is not None:
+                formatted_content += f"Confidence: {confidence}\n"
+            formatted_content += "\n"
+
+            self._append_to_reasoning_content(formatted_content)
+            return reasoning_step
+
+        # Case 2: ReasoningTools.analyze (has title, result, analysis, optional next_action and confidence)
+        elif tool_name.lower() == "analyze" and "title" in tool_args:
+            title = tool_args["title"]
+            result = tool_args.get("result", "")
+            analysis = tool_args.get("analysis", "")
+            next_action = tool_args.get("next_action", "")
+            confidence = tool_args.get("confidence", None)
+
+            # Map string next_action to enum
+            next_action_enum = NextAction.CONTINUE
+            if next_action.lower() == "validate":
+                next_action_enum = NextAction.VALIDATE
+            elif next_action.lower() in ["final", "final_answer", "finalize"]:
+                next_action_enum = NextAction.FINAL_ANSWER
+
+            # Create a reasoning step
+            reasoning_step = ReasoningStep(
+                title=title,
+                result=result,
+                reasoning=analysis,
+                next_action=next_action_enum,
+                confidence=confidence,
+            )
+
+            # Add the step to the run response
+            self._add_reasoning_step_to_extra_data(reasoning_step)
+
+            formatted_content = f"## {title}\n"
+            if result:
+                formatted_content += f"Result: {result}\n"
+            if analysis:
+                formatted_content += f"{analysis}\n"
+            if next_action and next_action.lower() != "continue":
+                formatted_content += f"Next Action: {next_action}\n"
+            if confidence is not None:
+                formatted_content += f"Confidence: {confidence}\n"
+            formatted_content += "\n"
+
+            self._append_to_reasoning_content(formatted_content)
+            return reasoning_step
+
+        # Case 3: ThinkingTools.think (simple format, just has 'thought')
+        elif tool_name.lower() == "think" and "thought" in tool_args:
+            thought = tool_args["thought"]
+            reasoning_step = ReasoningStep(
+                title="Thinking",
+                reasoning=thought,
+                confidence=None,
+            )
+            formatted_content = f"## Thinking\n{thought}\n\n"
+            self._add_reasoning_step_to_extra_data(reasoning_step)
+            self._append_to_reasoning_content(formatted_content)
+            return reasoning_step
+
+        return None
+
+    def _append_to_reasoning_content(self, content: str) -> None:
+        """Helper to append content to the reasoning_content field."""
+        if not hasattr(self.run_response, "reasoning_content") or not self.run_response.reasoning_content:  # type: ignore
+            self.run_response.reasoning_content = content  # type: ignore
+        else:
+            self.run_response.reasoning_content += content  # type: ignore
+
+    def _add_reasoning_step_to_extra_data(self, reasoning_step: ReasoningStep) -> None:
+        if hasattr(self, "run_response") and self.run_response is not None:
+            if self.run_response.extra_data is None:
+                from agno.run.response import RunResponseExtraData
+
+                self.run_response.extra_data = RunResponseExtraData()
+
+            if self.run_response.extra_data.reasoning_steps is None:
+                self.run_response.extra_data.reasoning_steps = []
+
+            self.run_response.extra_data.reasoning_steps.append(reasoning_step)
+
+    def _add_reasoning_metrics_to_extra_data(self, reasoning_time_taken: float) -> None:
+        try:
+            if hasattr(self, "run_response") and self.run_response is not None:
+                if self.run_response.extra_data is None:
+                    from agno.run.response import RunResponseExtraData
+
+                    self.run_response.extra_data = RunResponseExtraData()
+
+                # Initialize reasoning_messages if it doesn't exist
+                if self.run_response.extra_data.reasoning_messages is None:
+                    self.run_response.extra_data.reasoning_messages = []
+
+                metrics_message = Message(
+                    role="assistant",
+                    content=self.run_response.reasoning_content,
+                    metrics={"time": reasoning_time_taken},
+                )
+
+                # Add the metrics message to the reasoning_messages
+                self.run_response.extra_data.reasoning_messages.append(metrics_message)
+
+        except Exception as e:
+            # Log the error but don't crash
+            from agno.utils.log import log_error
+
+            log_error(f"Failed to add reasoning metrics to extra_data: {str(e)}")
 
     ###########################################################################
     # Default Tools
@@ -5212,141 +5402,6 @@ class Agent:
                 panels = [p for p in panels if not isinstance(p, Status)]
                 live_log.update(Group(*panels))
 
-    def update_reasoning_content_from_tool_call(
-        self, tool_name: str, tool_args: Dict[str, Any]
-    ) -> Optional[ReasoningStep]:
-        """Update reasoning_content based on tool calls that look like thinking or reasoning tools."""
-
-        # Case 1: ReasoningTools.think (has title, thought, optional action and confidence)
-        if tool_name.lower() == "think" and "title" in tool_args and "thought" in tool_args:
-            title = tool_args["title"]
-            thought = tool_args["thought"]
-            action = tool_args.get("action", "")
-            confidence = tool_args.get("confidence", None)
-
-            # Create a reasoning step
-            reasoning_step = ReasoningStep(
-                title=title,
-                reasoning=thought,
-                action=action,
-                next_action=NextAction.CONTINUE,
-                confidence=confidence,
-            )
-
-            # Add the step to the run response
-            self._add_reasoning_step_to_extra_data(reasoning_step)
-
-            formatted_content = f"## {title}\n{thought}\n"
-            if action:
-                formatted_content += f"Action: {action}\n"
-            if confidence is not None:
-                formatted_content += f"Confidence: {confidence}\n"
-            formatted_content += "\n"
-
-            self._append_to_reasoning_content(formatted_content)
-            return reasoning_step
-
-        # Case 2: ReasoningTools.analyze (has title, result, analysis, optional next_action and confidence)
-        elif tool_name.lower() == "analyze" and "title" in tool_args:
-            title = tool_args["title"]
-            result = tool_args.get("result", "")
-            analysis = tool_args.get("analysis", "")
-            next_action = tool_args.get("next_action", "")
-            confidence = tool_args.get("confidence", None)
-
-            # Map string next_action to enum
-            next_action_enum = NextAction.CONTINUE
-            if next_action.lower() == "validate":
-                next_action_enum = NextAction.VALIDATE
-            elif next_action.lower() in ["final", "final_answer", "finalize"]:
-                next_action_enum = NextAction.FINAL_ANSWER
-
-            # Create a reasoning step
-            reasoning_step = ReasoningStep(
-                title=title,
-                result=result,
-                reasoning=analysis,
-                next_action=next_action_enum,
-                confidence=confidence,
-            )
-
-            # Add the step to the run response
-            self._add_reasoning_step_to_extra_data(reasoning_step)
-
-            formatted_content = f"## {title}\n"
-            if result:
-                formatted_content += f"Result: {result}\n"
-            if analysis:
-                formatted_content += f"{analysis}\n"
-            if next_action and next_action.lower() != "continue":
-                formatted_content += f"Next Action: {next_action}\n"
-            if confidence is not None:
-                formatted_content += f"Confidence: {confidence}\n"
-            formatted_content += "\n"
-
-            self._append_to_reasoning_content(formatted_content)
-            return reasoning_step
-
-        # Case 3: ThinkingTools.think (simple format, just has 'thought')
-        elif tool_name.lower() == "think" and "thought" in tool_args:
-            thought = tool_args["thought"]
-            reasoning_step = ReasoningStep(
-                title="Thinking",
-                reasoning=thought,
-                confidence=None,
-            )
-            formatted_content = f"## Thinking\n{thought}\n\n"
-            self._add_reasoning_step_to_extra_data(reasoning_step)
-            self._append_to_reasoning_content(formatted_content)
-            return reasoning_step
-
-        return None
-
-    def _append_to_reasoning_content(self, content: str) -> None:
-        """Helper to append content to the reasoning_content field."""
-        if not hasattr(self.run_response, "reasoning_content") or not self.run_response.reasoning_content:  # type: ignore
-            self.run_response.reasoning_content = content  # type: ignore
-        else:
-            self.run_response.reasoning_content += content  # type: ignore
-
-    def _add_reasoning_step_to_extra_data(self, reasoning_step: ReasoningStep) -> None:
-        if hasattr(self, "run_response") and self.run_response is not None:
-            if self.run_response.extra_data is None:
-                from agno.run.response import RunResponseExtraData
-
-                self.run_response.extra_data = RunResponseExtraData()
-
-            if self.run_response.extra_data.reasoning_steps is None:
-                self.run_response.extra_data.reasoning_steps = []
-
-            self.run_response.extra_data.reasoning_steps.append(reasoning_step)
-
-    def _add_reasoning_metrics_to_extra_data(self, reasoning_time_taken: float) -> None:
-        try:
-            if hasattr(self, "run_response") and self.run_response is not None:
-                if self.run_response.extra_data is None:
-                    from agno.run.response import RunResponseExtraData
-
-                    self.run_response.extra_data = RunResponseExtraData()
-
-                # Initialize reasoning_messages if it doesn't exist
-                if self.run_response.extra_data.reasoning_messages is None:
-                    self.run_response.extra_data.reasoning_messages = []
-
-                metrics_message = Message(
-                    role="assistant",
-                    content=self.run_response.reasoning_content,
-                    metrics={"time": reasoning_time_taken},
-                )
-
-                # Add the metrics message to the reasoning_messages
-                self.run_response.extra_data.reasoning_messages.append(metrics_message)
-        except Exception as e:
-            # Log the error but don't crash
-            from agno.utils.log import log_error
-
-            log_error(f"Failed to add reasoning metrics to extra_data: {str(e)}")
-
     def cli_app(
         self,
         message: Optional[str] = None,
@@ -5359,7 +5414,19 @@ class Agent:
         exit_on: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> None:
+        """Run an interactive command-line interface to interact with the agent."""
+
+        from inspect import isawaitable
+
         from rich.prompt import Prompt
+
+        # Ensuring the agent is not using our async MCP tools
+        if self.tools is not None:
+            for tool in self.tools:
+                if isawaitable(tool):
+                    raise NotImplementedError("Use `acli_app` to use async tools.")
+                if tool.__class__.__name__ in ["MCPTools", "MultiMCPTools"]:
+                    raise NotImplementedError("Use `acli_app` to use MCP tools.")
 
         if message:
             self.print_response(
@@ -5373,5 +5440,38 @@ class Agent:
                 break
 
             self.print_response(
+                message=message, stream=stream, markdown=markdown, user_id=user_id, session_id=session_id, **kwargs
+            )
+
+    async def acli_app(
+        self,
+        message: Optional[str] = None,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        user: str = "User",
+        emoji: str = ":sunglasses:",
+        stream: bool = False,
+        markdown: bool = False,
+        exit_on: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Run an interactive command-line interface to interact with the agent.
+        Works with agent dependencies requiring async logic.
+        """
+        from rich.prompt import Prompt
+
+        if message:
+            await self.aprint_response(
+                message=message, stream=stream, markdown=markdown, user_id=user_id, session_id=session_id, **kwargs
+            )
+
+        _exit_on = exit_on or ["exit", "quit", "bye"]
+        while True:
+            message = Prompt.ask(f"[bold] {emoji} {user} [/bold]")
+            if message in _exit_on:
+                break
+
+            await self.aprint_response(
                 message=message, stream=stream, markdown=markdown, user_id=user_id, session_id=session_id, **kwargs
             )
