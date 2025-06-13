@@ -4,7 +4,7 @@ import uuid
 
 import pytest
 
-from agno.agent import Agent
+from agno.agent.agent import Agent
 from agno.memory.v2.db.sqlite import SqliteMemoryDb
 from agno.memory.v2.memory import Memory
 from agno.models.anthropic.claude import Claude
@@ -64,49 +64,82 @@ def memory(memory_db):
 
 
 @pytest.fixture
-def web_agent():
-    """Create a web agent for testing."""
-    from agno.tools.duckduckgo import DuckDuckGoTools
-
-    return Agent(
-        name="Web Agent",
-        model=OpenAIChat(id="gpt-4o-mini"),
-        role="Search the web for information",
-        tools=[DuckDuckGoTools(cache_results=True)],
-    )
-
-
-@pytest.fixture
-def finance_agent():
-    """Create a finance agent for testing."""
-    from agno.tools.yfinance import YFinanceTools
-
-    return Agent(
-        name="Finance Agent",
-        model=OpenAIChat(id="gpt-4o-mini"),
-        role="Get financial data",
-        tools=[YFinanceTools(stock_price=True)],
-    )
-
-
-@pytest.fixture
-def analysis_agent():
-    """Create an analysis agent for testing."""
-    return Agent(name="Analysis Agent", model=OpenAIChat(id="gpt-4o-mini"), role="Analyze data and provide insights")
-
-
-@pytest.fixture
-def route_team(web_agent, finance_agent, analysis_agent, team_storage, memory):
+def route_team(team_storage, memory):
     """Create a route team with storage and memory for testing."""
     return Team(
         name="Route Team",
         mode="route",
         model=OpenAIChat(id="gpt-4o-mini"),
-        members=[web_agent, finance_agent, analysis_agent],
+        members=[],
         storage=team_storage,
         memory=memory,
         enable_user_memories=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_run_history_persistence(route_team, team_storage, memory):
+    """Test that all runs within a session are persisted in storage."""
+    user_id = "john@example.com"
+    session_id = "session_123"
+    num_turns = 5
+
+    # Clear memory for this specific test case
+    memory.clear()
+
+    # Perform multiple turns
+    conversation_messages = [
+        "What's the weather like today?",
+        "What about tomorrow?",
+        "Any recommendations for indoor activities?",
+        "Search for nearby museums.",
+        "Which one has the best reviews?",
+    ]
+
+    assert len(conversation_messages) == num_turns
+
+    for msg in conversation_messages:
+        await route_team.arun(msg, user_id=user_id, session_id=session_id)
+
+    # Verify the stored session data after all turns
+    team_session = team_storage.read(session_id=session_id)
+
+    stored_memory_data = team_session.memory
+    assert stored_memory_data is not None, "Memory data not found in stored session."
+
+    stored_runs = stored_memory_data["runs"]
+    assert isinstance(stored_runs, list), "Stored runs data is not a list."
+
+    first_user_message_content = stored_runs[0]["messages"][1]["content"]
+    assert first_user_message_content == conversation_messages[0]
+
+
+@pytest.mark.asyncio
+async def test_run_session_summary(route_team, team_storage, memory):
+    """Test that the session summary is persisted in storage."""
+    session_id = "session_123"
+    user_id = "john@example.com"
+
+    # Enable session summaries
+    route_team.enable_user_memories = False
+    route_team.enable_session_summaries = True
+
+    # Clear memory for this specific test case
+    memory.clear()
+
+    await route_team.arun("Where is New York?", user_id=user_id, session_id=session_id)
+
+    assert route_team.get_session_summary(user_id=user_id, session_id=session_id).summary is not None
+
+    team_session = team_storage.read(session_id=session_id)
+    assert len(team_session.memory["summaries"][user_id][session_id]) > 0
+
+    await route_team.arun("Where is Tokyo?", user_id=user_id, session_id=session_id)
+
+    assert route_team.get_session_summary(user_id=user_id, session_id=session_id).summary is not None
+
+    team_session = team_storage.read(session_id=session_id)
+    assert len(team_session.memory["summaries"][user_id][session_id]) > 0
 
 
 @pytest.mark.asyncio
@@ -172,3 +205,46 @@ async def test_multi_user_multi_session_route_team(route_team, team_storage, mem
     user_3_sessions = team_storage.get_all_sessions(user_id=user_3_id)
     assert len(user_3_sessions) == 1
     assert user_3_session_1_id in [session.session_id for session in user_3_sessions]
+
+
+@pytest.mark.asyncio
+async def test_correct_sessions_in_db(route_team, team_storage, agent_storage):
+    """Test multi-user multi-session route team with storage and memory."""
+    # Define user and session IDs
+    user_id = "user_1@example.com"
+    session_id = "session_123"
+
+    route_team.mode = "coordinate"
+    route_team.members = [
+        Agent(
+            name="Answers small questions",
+            model=OpenAIChat(id="gpt-4o-mini"),
+            storage=agent_storage,
+        ),
+        Agent(
+            name="Answers big questions",
+            model=OpenAIChat(id="gpt-4o-mini"),
+            storage=agent_storage,
+        ),
+    ]
+
+    # Should create a new team session and agent session
+    await route_team.arun(
+        "Ask a big and a small question to your member agents", user_id=user_id, session_id=session_id
+    )
+
+    team_sessions = team_storage.get_all_sessions(entity_id=route_team.team_id)
+    assert len(team_sessions) == 1
+    assert team_sessions[0].session_id == session_id
+    assert team_sessions[0].user_id == user_id
+    assert len(team_sessions[0].memory["runs"][0]["member_responses"]) == 2
+
+    agent_sessions = agent_storage.get_all_sessions()
+    # Single shared session for both agents
+    assert len(agent_sessions) == 1
+    assert agent_sessions[0].session_id == session_id
+    assert agent_sessions[0].user_id == user_id
+    assert len(agent_sessions[0].memory["runs"]) == 2
+    assert agent_sessions[0].memory["runs"][0]["session_id"] == session_id
+    assert agent_sessions[0].memory["runs"][1]["session_id"] == session_id
+    assert agent_sessions[0].memory["runs"][0]["run_id"] != agent_sessions[0].memory["runs"][1]["run_id"]
